@@ -5,11 +5,21 @@
 **Make background jobs resilient to crashes, retries, and duplicate delivery.**
 
 [![CI](https://github.com/egecagintepe/celery-reliability-engineer/actions/workflows/ci.yml/badge.svg)](https://github.com/egecagintepe/celery-reliability-engineer/actions)
+[![Release](https://img.shields.io/github/v/release/egecagintepe/celery-reliability-engineer?color=blue)](https://github.com/egecagintepe/celery-reliability-engineer/releases/latest)
+[![skills.sh](https://img.shields.io/badge/skills.sh-celery--reliability--engineer-blue)](https://skills.sh/egecagintepe/celery-reliability-engineer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
 [![Agent Skills: v1](https://img.shields.io/badge/Agent%20Skills-v1.0-emerald.svg)](https://agentskills.io/specification)
 
 *Distributed task queue reliability toolkit, configuration linter, fail-closed locks, and full-jitter backoff for Celery and Redis.*
+
+<br />
+
+```bash
+npx skills add egecagintepe/celery-reliability-engineer
+```
+
+<br />
 
 ```
    Task Enqueued ──► [ AT-LEAST-ONCE BROKER ] ──► Worker Crash?
@@ -26,33 +36,38 @@
 
 ---
 
-## The Problem
+## Problem → Solution → Result
 
-Celery and Redis are the industry standard for Python background processing, but naive setups fail catastrophically under load:
-1. **At-Least-Once Duplication**: Brokers guarantee delivery, not single execution. A worker crash after database commit re-executes the job, double-charging customers or sending duplicate emails.
-2. **Silent Distributed Lock Degradation**: Unsafe lock implementations silently fall back to local in-memory dictionaries when Redis drops, allowing multiple workers across containers to run conflicting tasks simultaneously.
-3. **Thundering Herd Retry Storms**: When a downstream API returns HTTP 429 or 500, hundreds of workers retrying on fixed intervals slam the API at the exact same millisecond, turning temporary hiccups into sustained outages.
-4. **Worker Starvation via Prefetch**: On mixed workloads (100ms fast tasks mixed with 10-minute batch jobs), default `worker_prefetch_multiplier = 4` causes idle workers to sit starved while one worker hoards tasks.
-5. **Autoscale Pitfalls**: Celery's built-in `autoscale` terminates workers based on queue length, inadvertently killing workers executing long-running batch jobs mid-task.
+- **The Problem**: Celery and Redis are the industry standard for Python asynchronous processing, but default setups fail catastrophically under load:
+  1. **At-Least-Once Duplication**: Brokers guarantee delivery, not single execution. A worker crash after a database commit causes the task to re-execute, double-billing customers or spamming emails.
+  2. **Silent Distributed Lock Degradation**: Unsafe lock libraries silently fall back to local in-memory dictionaries when Redis connections drop, letting workers in separate containers execute the same task concurrently.
+  3. **Thundering Herd Retry Storms**: When downstream APIs return HTTP 429 or 500, hundreds of workers retrying on fixed 10-second intervals strike the API at the exact same millisecond, turning temporary glitches into sustained outages.
+  4. **Prefetch Starvation**: Default `worker_prefetch_multiplier = 4` on mixed workloads (100ms jobs mixed with 15-minute reports) causes one worker to hoard long tasks while other workers sit starved and idle.
+
+- **The Solution**: `celery-reliability-engineer` provides fail-closed distributed locking (`RedisDistributedLock`), full-jitter exponential backoff schedules (`JitteredBackoff`), and an AST-based configuration linter (`celery_doctor.py`) that audits Celery settings against production failure modes.
+
+- **The Result**: Tasks fail closed instead of corrupting data during network blips, retries are decorrelated across random windows, workers share mixed queues evenly (`prefetch_multiplier = 1`), and concurrent tasks verify durable database state rather than dropping pending work.
 
 ---
 
 ## Quick Install (30 Seconds)
 
-### Using Agent Skills CLI (`skills.sh`)
+### Option 1: Using Agent Skills CLI (`skills.sh`)
 ```bash
 npx skills add egecagintepe/celery-reliability-engineer
 ```
 
-### Direct Agent Integration (Claude Code, Cursor, Codex)
+### Option 2: Direct Agent Integration (Claude Code, Cursor, Codex)
+Clone into your project's local agent skills directory:
 ```bash
 git clone https://github.com/egecagintepe/celery-reliability-engineer.git .agents/skills/celery-reliability-engineer
 ```
 
-### Standalone Python Toolkit
+### Option 3: Standalone Python Toolkit (Zero Dependencies)
 ```bash
 git clone https://github.com/egecagintepe/celery-reliability-engineer.git
 cd celery-reliability-engineer
+python scripts/celery_doctor.py --help
 ```
 
 ---
@@ -113,6 +128,8 @@ def call_partner_webhook(self, url, payload):
         raise self.retry(exc=exc, countdown=delay)
 ```
 
+See the full production task scenario in [examples/resilient_task_example.py](examples/resilient_task_example.py) and baseline settings in [examples/celery_conf_recommended.py](examples/celery_conf_recommended.py).
+
 ---
 
 ## CLI Diagnostics (`celery_doctor.py`)
@@ -162,6 +179,24 @@ Full Jitter Retry   -> Peak Herd: 3 simultaneous requests at T=4s (SMOOTH DISTRI
 
 ---
 
+## Frequently Asked Questions (FAQ)
+
+### Does a distributed lock guarantee durable idempotency?
+**No.** A distributed lock provides *concurrency coordination* (preventing two workers from processing the same entity simultaneously). Durable idempotency requires transactional database status checkpoints (`UPDATE orders SET status = 'COMPLETED' WHERE id = 101 AND status = 'PENDING'`). Always combine locks with transactional state machine checks.
+
+### What happens when a lock is contested by another worker?
+Our resilient pattern does not silently acknowledge and drop work. When `TaskLockAcquisitionError` occurs, the task inspects durable database state:
+- If the job is already `COMPLETED`, it acknowledges the duplicate safely (`ALREADY_COMPLETED`).
+- If the job is still `PENDING`, it raises `retry` with exponential jitter backoff so it can run if the competing worker crashes.
+
+### Why is `worker_prefetch_multiplier = 1` critical for mixed workloads?
+Celery defaults to `prefetch_multiplier = 4`. If a worker with 4 concurrency starts, it reserves `4 * 4 = 16` tasks from the broker. If those tasks include 15-minute reports, that worker sits holding tasks for hours while other workers in the cluster sit idle with nothing to do. Setting prefetch to 1 guarantees fair work distribution.
+
+### Does `celery_doctor.py` require a running Redis or Celery cluster?
+**No.** The linter performs static Abstract Syntax Tree (AST) analysis on your Python configuration files. It executes with zero external dependencies and zero live infrastructure requirements.
+
+---
+
 ## Deep Documentation
 
 - [Idempotency Patterns & Distributed Locks](references/idempotency_patterns.md) — State machines vs locks
@@ -169,6 +204,7 @@ Full Jitter Retry   -> Peak Herd: 3 simultaneous requests at T=4s (SMOOTH DISTRI
 - [Retry Storms & API Quota Handling](references/retry_storm_prevention.md) — Rate limits vs daily resets
 - [Broker Resilience & Connection Lifecycles](references/broker_resilience.md) — Visibility timeouts & keepalives
 - [Recommended Configuration Reference](examples/celery_conf_recommended.py) — Production baseline settings
+- [Resilient Task Scenario Example](examples/resilient_task_example.py) — End-to-end Python implementation
 
 ---
 
