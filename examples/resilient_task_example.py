@@ -2,10 +2,11 @@
 Production Reference: Resilient Celery Background Processing.
 Demonstrates:
   1. Distributed locking with fail-closed semantics (RedisDistributedLock)
-  2. Database state-machine checkpointing (PENDING -> PROCESSING -> COMPLETED)
-  3. Handling crash-after-commit before Celery ACK
-  4. Distinguishing HTTP 429 rate limits from daily quota exhaustion
-  5. Full-jitter exponential backoff
+  2. Durable state-machine checkpointing (PENDING -> PROCESSING -> COMPLETED)
+  3. Safe lock contention handling: NEVER acknowledge and drop uncompleted work
+  4. Handling crash-after-commit before Celery ACK
+  5. Distinguishing HTTP 429 burst rate limits from daily quota exhaustion
+  6. Full-jitter exponential backoff for transient retries
 """
 
 import time
@@ -37,7 +38,13 @@ def resilient_sync_task(
     max_attempts: int = 5
 ) -> Dict[str, Any]:
     """
-    Executes an external synchronization with distributed locking and checkpointing.
+    Executes an external synchronization with distributed locking and durable checkpointing.
+    
+    CRITICAL RULE ON LOCK CONTENTION:
+      If a lock cannot be acquired because another worker holds it, the task must NEVER
+      silently return success or acknowledge the message unless durable state confirms
+      the work is already COMPLETED. Silently dropping concurrent tasks leads to permanent
+      data loss if the holding worker crashes or if the tasks represented distinct payloads.
     """
     lock_key = f"sync_task_{task_id}"
 
@@ -78,17 +85,30 @@ def resilient_sync_task(
             logger.info("[Success] Task %s committed as COMPLETED.", task_id)
             return {"status": "SUCCESS", "task_id": task_id}
 
-    except TaskLockAcquisitionError:
-        # Another worker is actively executing this exact task right now
-        logger.warning("[Concurrency Guard] Task %s is already in-progress by another worker. Dropping duplicate delivery.", task_id)
-        return {"status": "LOCKED_IN_PROGRESS", "task_id": task_id}
+    except TaskLockAcquisitionError as lock_err:
+        # Another worker holds the lock.
+        # Check durable state: has the work already been completed?
+        if db_state.get(task_id) == "COMPLETED":
+            logger.info("[Lock Contention Resolved] Work was already completed by holding worker for task %s. Safe to acknowledge.", task_id)
+            return {"status": "ALREADY_COMPLETED", "task_id": task_id}
+
+        # Work is NOT completed: We MUST NOT acknowledge and drop the message!
+        # Re-raise for Celery retry with jitter to keep the work alive in the queue.
+        if current_attempt >= max_attempts:
+            logger.critical("[Lock Contention Exhausted] Task %s reached maximum retries (%d) without acquiring lock. Marking FAILED.", task_id, max_attempts)
+            db_state[task_id] = "LOCK_FAILED"
+            raise lock_err
+
+        delay = backoff.calculate_delay(current_attempt)
+        logger.warning("[Lock Contention] Task %s is locked. Re-queueing with jitter (delay: %.2fs, Attempt %d/%d).", task_id, delay, current_attempt, max_attempts)
+        # In real Celery: raise self.retry(exc=lock_err, countdown=delay, max_retries=max_attempts)
+        raise lock_err
 
     except SimulatedExternalAPIError as err:
         if err.is_daily_quota:
             # Daily quota exhaustion: Do NOT sleep 10s in useless loop.
             # Calculate sleep until midnight + random jitter buffer.
             now_epoch = time.time()
-            # Simulate next day midnight epoch (86400s later)
             midnight_epoch = now_epoch + 14400  # 4 hours later
             park_delay = JitteredBackoff.calculate_quota_reset_delay(now_epoch, midnight_epoch)
             logger.error("[Daily Quota Exhausted] Parking task %s until reset epoch (delay: %.1fs).", task_id, park_delay)

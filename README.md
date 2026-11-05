@@ -75,18 +75,25 @@ cd celery-reliability-engineer
 Zero-dependency, production-grade distributed lock with Lua atomic compare-and-delete:
 
 ```python
-from idempotency_helpers import RedisDistributedLock, TaskLockAcquisitionError
+from idempotency_helpers import RedisDistributedLock, TaskLockAcquisitionError, JitteredBackoff
 
-@app.task(bind=True, acks_late=True)
+backoff = JitteredBackoff(base_delay=2.0, max_delay=120.0)
+
+@app.task(bind=True, acks_late=True, max_retries=5)
 def generate_monthly_invoice(self, customer_id):
     try:
         # Fails closed if Redis is down (never silently falls back to local memory)
         with RedisDistributedLock(key=f"invoice_{customer_id}", ttl_seconds=120, redis_client=redis_conn):
             # Safe execution boundary
             process_invoice(customer_id)
-    except TaskLockAcquisitionError:
-        logger.warning("Invoice generation already in-flight by another worker.")
-        return {"status": "SKIPPED_CONCURRENT"}
+    except TaskLockAcquisitionError as exc:
+        # Check durable database state: has the invoice already completed?
+        if is_invoice_already_completed(customer_id):
+            return {"status": "ALREADY_COMPLETED"}
+        # Work is still pending: DO NOT silently acknowledge and drop! Re-queue with jitter
+        delay = backoff.calculate_delay(self.request.retries + 1)
+        logger.warning("Invoice in-flight by another worker. Re-queueing with jitter (delay: %.2fs).", delay)
+        raise self.retry(exc=exc, countdown=delay)
 ```
 
 ### 2. `JitteredBackoff` (Full-Jitter Exponential Retry)
@@ -186,7 +193,7 @@ Full Jitter Retry   -> Peak Herd: 3 simultaneous requests at T=4s (SMOOTH DISTRI
 
 ## Testing
 
-Run the full automated test suite (19 tests):
+Run the full automated test suite (22 tests):
 ```bash
 python -m unittest discover -s tests
 ```

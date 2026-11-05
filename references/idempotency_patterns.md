@@ -34,6 +34,9 @@ When coordinating tasks across multiple containers or machines, use fail-closed 
    - Size TTL comfortably above maximum task runtime.
    - Use soft execution time limits (`task_soft_time_limit`).
    - Guard database writes with optimistic locking / version checks (`UPDATE ... WHERE version = 1`).
+4. **Lock Contention Strategy**:
+   - If a lock cannot be acquired because another worker holds it, **never silently acknowledge and drop the message**. Silently dropping concurrent messages causes permanent data loss if the worker holding the lock crashes, or if the tasks carried distinct payloads.
+   - Always verify durable database state: if state is already `COMPLETED`, it is safe to acknowledge; if state is `PENDING`, re-raise with jittered backoff (`self.retry(...)`).
 
 ---
 
