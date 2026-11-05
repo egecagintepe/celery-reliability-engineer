@@ -30,3 +30,4 @@ jobs:
       run: |
         python scripts/celery_doctor.py lint-config --config examples/celery_conf_recommended.py
         python scripts/celery_doctor.py calc-backoff --attempt 2
+

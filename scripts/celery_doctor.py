@@ -11,139 +11,205 @@ import json
 import os
 import random
 import sys
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 RECOMMENDED_RELIABILITY_RULES = [
     {
         "setting": "task_acks_late",
         "aliases": ["CELERY_TASK_ACKS_LATE", "CELERY_ACKS_LATE"],
         "expected": True,
-        "severity": "CRITICAL",
-        "description": "Enables late acknowledgment (ack after task completion). Prevents task loss if worker dies."
+        "critical_for": "heterogeneous",
+        "description": "Late acknowledgment (ack after task completion). Prevents task loss if worker dies."
     },
     {
         "setting": "task_reject_on_worker_lost",
         "aliases": ["CELERY_TASK_REJECT_ON_WORKER_LOST"],
         "expected": True,
-        "severity": "CRITICAL",
+        "critical_for": "all",
         "description": "Rejects and requeues task if child worker process is killed (e.g. OOM or SIGKILL)."
     },
     {
         "setting": "worker_prefetch_multiplier",
         "aliases": ["CELERY_WORKER_PREFETCH_MULTIPLIER"],
         "expected": 1,
-        "severity": "HIGH",
-        "description": "Prefetch=1 ensures workers only pull one task at a time, eliminating queue starvation."
+        "critical_for": "heterogeneous",
+        "description": "Prefetch=1 ensures workers only pull one task at a time, eliminating queue starvation on mixed workloads."
     },
     {
         "setting": "worker_max_tasks_per_child",
         "aliases": ["CELERY_WORKER_MAX_TASKS_PER_CHILD"],
-        "expected": "ANY_INT",
-        "severity": "MEDIUM",
+        "expected": "POSITIVE_INT",
+        "critical_for": "long-running",
         "description": "Recycles worker processes after N tasks to prevent unbounded Python memory leaks."
     },
     {
         "setting": "task_time_limit",
         "aliases": ["CELERY_TASK_TIME_LIMIT"],
-        "expected": "ANY_INT",
-        "severity": "HIGH",
+        "expected": "POSITIVE_INT",
+        "critical_for": "all",
         "description": "Hard execution limit (SIGKILL). Prevents rogue or deadlocked tasks from running forever."
     },
     {
         "setting": "task_soft_time_limit",
         "aliases": ["CELERY_TASK_SOFT_TIME_LIMIT"],
-        "expected": "ANY_INT",
-        "severity": "MEDIUM",
-        "description": "Soft execution limit (SoftTimeLimitExceeded exception). Allows clean teardown."
+        "expected": "POSITIVE_INT",
+        "critical_for": "all",
+        "description": "Soft execution limit (SoftTimeLimitExceeded exception). Allows clean task cleanup before SIGKILL."
     },
     {
         "setting": "broker_connection_retry_on_startup",
         "aliases": ["CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP"],
         "expected": True,
-        "severity": "MEDIUM",
+        "critical_for": "all",
         "description": "Retries connecting to message broker on worker startup rather than crashing immediately."
     }
 ]
 
-def extract_settings_from_python_file(filepath: str) -> Dict[str, Any]:
+def extract_settings_from_python_file(filepath: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Parses Python source with AST, distinguishing static literal values
+    from dynamically computed expressions (e.g. os.environ.get, function calls).
+    """
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         source = f.read()
 
     tree = ast.parse(source, filename=filepath)
     extracted = {}
 
+    def parse_value(val_node: ast.AST) -> Tuple[Any, str]:
+        try:
+            return ast.literal_eval(val_node), "STATIC_LITERAL"
+        except Exception:
+            return None, "DYNAMICALLY_COMPUTED"
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    var_name = target.id
-                    try:
-                        val = ast.literal_eval(node.value)
-                        extracted[var_name] = val
-                    except Exception:
-                        pass
-        # Support app.conf.update(...)
+                    val, status = parse_value(node.value)
+                    extracted[target.id] = {"value": val, "status": status}
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute) and node.func.attr == "update":
                 for arg in node.args:
                     if isinstance(arg, ast.Dict):
                         for k, v in zip(arg.keys, arg.values):
                             if isinstance(k, ast.Constant):
-                                try:
-                                    val = ast.literal_eval(v)
-                                    extracted[k.value] = val
-                                except Exception:
-                                    pass
+                                val, status = parse_value(v)
+                                extracted[k.value] = {"value": val, "status": status}
     return extracted
 
-def lint_celery_config(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+def lint_celery_config(settings: Dict[str, Dict[str, Any]], workload_profile: str = "heterogeneous") -> Dict[str, Any]:
+    """
+    Audits Celery configuration distinguishing:
+      - EXPLICITLY_UNSAFE
+      - MISSING_CONFIG
+      - DEFAULTS_REQUIRING_VERIFICATION
+      - DYNAMICALLY_COMPUTED
+      - VERIFIED_SAFE
+    """
     findings = []
-    
-    # Check for autoscale hazard
-    for k in ["worker_autoscale", "CELERY_WORKER_AUTOSCALE"]:
-        if k in settings and settings[k]:
-            findings.append({
-                "setting": k,
-                "current_value": settings[k],
-                "severity": "WARNING",
-                "message": "Autoscale can terminate busy workers mid-job on long-running tasks. Prefer fixed concurrency."
-            })
+    verified_safe = []
+    dynamically_computed = []
 
+    # 1. Check for autoscale hazard
+    for k in ["worker_autoscale", "CELERY_WORKER_AUTOSCALE"]:
+        if k in settings:
+            item = settings[k]
+            if item["status"] == "DYNAMICALLY_COMPUTED":
+                dynamically_computed.append({
+                    "setting": k,
+                    "status": "DYNAMICALLY_COMPUTED",
+                    "note": "Autoscale expression evaluated at runtime; verify it is not enabled for long-running jobs."
+                })
+            elif item["value"]:
+                findings.append({
+                    "setting": k,
+                    "classification": "EXPLICITLY_UNSAFE",
+                    "severity": "CRITICAL",
+                    "current_value": item["value"],
+                    "message": "Autoscale terminates busy workers mid-job during backlog recovery. Use fixed concurrency for non-trivial tasks."
+                })
+
+    # 2. Check reliability rules
     for rule in RECOMMENDED_RELIABILITY_RULES:
         found_key = None
-        current_val = None
+        current_data = None
         for alias in [rule["setting"]] + rule["aliases"]:
             if alias in settings:
                 found_key = alias
-                current_val = settings[alias]
+                current_data = settings[alias]
                 break
 
         if found_key is None:
             findings.append({
                 "setting": rule["setting"],
+                "classification": "MISSING_CONFIG",
+                "severity": "HIGH" if rule["critical_for"] in ("all", workload_profile) else "MEDIUM",
                 "current_value": None,
-                "severity": rule["severity"],
-                "message": f"Setting missing. {rule['description']}"
+                "message": f"Setting missing. {rule['description']} (Defaults to Celery baseline which requires verification)."
             })
-        else:
-            exp = rule["expected"]
-            if exp == "ANY_INT":
-                if not isinstance(current_val, int) or current_val <= 0:
-                    findings.append({
-                        "setting": found_key,
-                        "current_value": current_val,
-                        "severity": rule["severity"],
-                        "message": f"Expected positive integer, got: {current_val}."
-                    })
-            elif current_val != exp:
+            continue
+
+        if current_data["status"] == "DYNAMICALLY_COMPUTED":
+            dynamically_computed.append({
+                "setting": found_key,
+                "classification": "DYNAMICALLY_COMPUTED",
+                "severity": "INFO",
+                "note": f"Evaluated dynamically at runtime. Verify in deployment environment that it satisfies: {rule['expected']}."
+            })
+            continue
+
+        val = current_data["value"]
+        exp = rule["expected"]
+
+        if exp == "POSITIVE_INT":
+            if isinstance(val, int) and val > 0:
+                verified_safe.append({"setting": found_key, "value": val})
+            else:
                 findings.append({
                     "setting": found_key,
-                    "current_value": current_val,
-                    "severity": rule["severity"],
-                    "message": f"Value is {current_val}, expected {exp}. {rule['description']}"
+                    "classification": "EXPLICITLY_UNSAFE",
+                    "severity": "HIGH",
+                    "current_value": val,
+                    "message": f"Expected positive integer, got: {val}."
                 })
+        elif exp is True:
+            if val is True:
+                verified_safe.append({"setting": found_key, "value": val})
+            else:
+                findings.append({
+                    "setting": found_key,
+                    "classification": "EXPLICITLY_UNSAFE",
+                    "severity": "CRITICAL" if rule["critical_for"] in ("all", workload_profile) else "MEDIUM",
+                    "current_value": val,
+                    "message": f"Value is {val}, expected True. {rule['description']}"
+                })
+        elif exp == 1:
+            if val == 1:
+                verified_safe.append({"setting": found_key, "value": val})
+            else:
+                if workload_profile == "heterogeneous":
+                    findings.append({
+                        "setting": found_key,
+                        "classification": "DEFAULTS_REQUIRING_VERIFICATION",
+                        "severity": "HIGH",
+                        "current_value": val,
+                        "message": f"Value is {val}. On heterogeneous workloads, prefetch > 1 causes idle workers while one worker hoards long tasks."
+                    })
+                else:
+                    verified_safe.append({"setting": found_key, "value": val, "note": "Acceptable for homogeneous short tasks."})
 
-    return findings
+    has_critical = any(f["severity"] == "CRITICAL" for f in findings)
+
+    return {
+        "workload_profile": workload_profile,
+        "is_safe": not has_critical,
+        "explicitly_unsafe": [f for f in findings if f["classification"] == "EXPLICITLY_UNSAFE"],
+        "missing_config": [f for f in findings if f["classification"] == "MISSING_CONFIG"],
+        "defaults_requiring_verification": [f for f in findings if f["classification"] == "DEFAULTS_REQUIRING_VERIFICATION"],
+        "dynamically_computed": dynamically_computed,
+        "verified_safe": verified_safe
+    }
 
 def simulate_retry_schedule(workers: int, attempts: int, base_delay: float = 2.0, max_delay: float = 60.0):
     fixed_times = []
@@ -153,11 +219,9 @@ def simulate_retry_schedule(workers: int, attempts: int, base_delay: float = 2.0
         current_fixed = 0.0
         current_jittered = 0.0
         for att in range(1, attempts + 1):
-            # Fixed delay (e.g. 5s)
             current_fixed += 5.0
             fixed_times.append(round(current_fixed, 1))
 
-            # Full jitter exponential
             cap = min(max_delay, base_delay * (2 ** (att - 1)))
             delay = random.uniform(0.1, cap)
             current_jittered += delay
@@ -172,6 +236,8 @@ def main():
     # Subcommand: lint-config
     lint_parser = subparsers.add_parser("lint-config", help="Audit Celery configuration file for reliability anti-patterns")
     lint_parser.add_argument("--config", required=True, help="Path to Python settings/config file")
+    lint_parser.add_argument("--workload-profile", choices=["heterogeneous", "homogeneous"], default="heterogeneous",
+                             help="Workload type: heterogeneous (mixed long/short) or homogeneous (fast uniform)")
     lint_parser.add_argument("--json", action="store_true", help="Output pure JSON")
 
     # Subcommand: calc-backoff
@@ -195,30 +261,39 @@ def main():
             print(f"Error: File not found: {args.config}", file=sys.stderr)
             sys.exit(1)
         settings = extract_settings_from_python_file(args.config)
-        findings = lint_celery_config(settings)
-        critical_count = sum(1 for f in findings if f["severity"] == "CRITICAL")
-        high_count = sum(1 for f in findings if f["severity"] == "HIGH")
-
-        output = {
-            "file": args.config,
-            "total_findings": len(findings),
-            "critical": critical_count,
-            "high": high_count,
-            "findings": findings
-        }
+        audit_res = lint_celery_config(settings, workload_profile=args.workload_profile)
 
         if args.json:
-            print(json.dumps(output, indent=2))
+            print(json.dumps(audit_res, indent=2))
         else:
-            print(f"=== Celery Reliability Audit: {args.config} ===")
-            if not findings:
-                print("[PASS] Excellent! All critical reliability settings are properly configured.")
-            else:
-                for f in findings:
-                    print(f"[{f['severity']}] {f['setting']}: {f['message']}")
-            print(f"\nSummary: {critical_count} Critical, {high_count} High, {len(findings)} Total.")
+            print(f"=== Celery Reliability Audit: {args.config} (Profile: {args.workload_profile}) ===")
+            if audit_res["explicitly_unsafe"]:
+                print("\n[EXPLICITLY UNSAFE]:")
+                for item in audit_res["explicitly_unsafe"]:
+                    print(f"  ! {item['setting']}: {item['message']}")
 
-        sys.exit(1 if critical_count > 0 else 0)
+            if audit_res["defaults_requiring_verification"]:
+                print("\n[DEFAULTS REQUIRING VERIFICATION]:")
+                for item in audit_res["defaults_requiring_verification"]:
+                    print(f"  ? {item['setting']}: {item['message']}")
+
+            if audit_res["missing_config"]:
+                print("\n[MISSING CONFIGURATION]:")
+                for item in audit_res["missing_config"]:
+                    print(f"  - {item['setting']}: {item['message']}")
+
+            if audit_res["dynamically_computed"]:
+                print("\n[DYNAMICALLY COMPUTED (Verify at Runtime)]:")
+                for item in audit_res["dynamically_computed"]:
+                    print(f"  ~ {item['setting']}: {item['note']}")
+
+            if audit_res["verified_safe"]:
+                print(f"\n[VERIFIED SAFE ({len(audit_res['verified_safe'])} settings)]: " + ", ".join(s["setting"] for s in audit_res["verified_safe"]))
+
+            status_str = "PASS" if audit_res["is_safe"] else "FAIL (Critical Hazards Present)"
+            print(f"\nFinal Audit Verdict: {status_str}")
+
+        sys.exit(0 if audit_res["is_safe"] else 1)
 
     elif args.subcommand == "calc-backoff":
         samples = []
@@ -242,7 +317,6 @@ def main():
 
     elif args.subcommand == "simulate-herd":
         fixed, jittered = simulate_retry_schedule(args.workers, args.attempts)
-        # Find maximum collisions in any 1-second window
         from collections import Counter
         fixed_buckets = Counter([int(t) for t in fixed])
         jittered_buckets = Counter([int(t) for t in jittered])

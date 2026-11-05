@@ -1,40 +1,55 @@
+<div align="center">
+
 # Celery Reliability Engineer
 
-[![CI Status](https://github.com/egecagintepe/celery-reliability-engineer/actions/workflows/ci.yml/badge.svg)](https://github.com/egecagintepe/celery-reliability-engineer/actions)
+**Make background jobs resilient to crashes, retries, and duplicate delivery.**
+
+[![CI](https://github.com/egecagintepe/celery-reliability-engineer/actions/workflows/ci.yml/badge.svg)](https://github.com/egecagintepe/celery-reliability-engineer/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python: 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
+[![Agent Skills: v1](https://img.shields.io/badge/Agent%20Skills-v1.0-emerald.svg)](https://agentskills.io/specification)
 
-Production-grade distributed task queue reliability toolkit, architectural guidelines, and diagnostic CLI for **Celery** and message brokers (**Redis**, RabbitMQ).
+*Distributed task queue reliability toolkit, configuration linter, fail-closed locks, and full-jitter backoff for Celery and Redis.*
 
-It provides automated configuration auditing, idempotency patterns, full-jitter exponential backoff calculators, thundering herd simulators, and battle-tested worker concurrency rules.
+```
+   Task Enqueued ──► [ AT-LEAST-ONCE BROKER ] ──► Worker Crash?
+                             │                         │
+                             ▼                         ▼
+                 [ REDIS DISTRIBUTED LOCK ]      acks_late=True
+                 (Fail-Closed Coordination)     (Re-queued to live worker)
+                             │                         │
+                             ▼                         ▼
+                 [ DB TRANSACTION COMMIT ]  ──► Duplicate Prevented!
+```
+
+</div>
 
 ---
 
-## Core Focus Areas
+## The Problem
 
-- **At-Least-Once Delivery & Idempotency**: Prevents duplicate execution bugs using state-machine transitions and distributed lease locks (`IdempotentTaskLock`).
-- **Worker Crash Survivability**: Enforces late acknowledgment (`acks_late=True`) paired with `reject_on_worker_lost=True` to eliminate lost tasks when workers terminate unexpectedly.
-- **Heterogeneous Workload Tuning**: Eliminates task starvation on mixed-duration workloads via `worker_prefetch_multiplier = 1`.
-- **Autoscaling Hazard Prevention**: Explains why built-in Celery autoscale strands queued long-running tasks and provides fixed concurrency sizing formulas.
-- **Thundering Herd Elimination**: Implements Full Jitter exponential backoff algorithms and differentiates transient HTTP 429 rate limits from daily quota resets.
-- **Python Memory Leak Control**: Configures worker recycling (`worker_max_tasks_per_child`) to bound Python memory fragmentation over continuous operation.
+Celery and Redis are the industry standard for Python background processing, but naive setups fail catastrophically under load:
+1. **At-Least-Once Duplication**: Brokers guarantee delivery, not single execution. A worker crash after database commit re-executes the job, double-charging customers or sending duplicate emails.
+2. **Silent Distributed Lock Degradation**: Unsafe lock implementations silently fall back to local in-memory dictionaries when Redis drops, allowing multiple workers across containers to run conflicting tasks simultaneously.
+3. **Thundering Herd Retry Storms**: When a downstream API returns HTTP 429 or 500, hundreds of workers retrying on fixed intervals slam the API at the exact same millisecond, turning temporary hiccups into sustained outages.
+4. **Worker Starvation via Prefetch**: On mixed workloads (100ms fast tasks mixed with 10-minute batch jobs), default `worker_prefetch_multiplier = 4` causes idle workers to sit starved while one worker hoards tasks.
+5. **Autoscale Pitfalls**: Celery's built-in `autoscale` terminates workers based on queue length, inadvertently killing workers executing long-running batch jobs mid-task.
 
 ---
 
-## Installation & Setup
+## Quick Install (30 Seconds)
 
-### 1. As an AI Agent Skill (Claude Code, Cursor, Antigravity)
+### Using Agent Skills CLI (`skills.sh`)
+```bash
+npx skills add egecagintepe/celery-reliability-engineer
+```
 
-Clone or link into your agent's skill directory:
-
+### Direct Agent Integration (Claude Code, Cursor, Codex)
 ```bash
 git clone https://github.com/egecagintepe/celery-reliability-engineer.git .agents/skills/celery-reliability-engineer
 ```
 
-Compatible agent environments will index `SKILL.md` to guide backend background task implementation and debugging.
-
-### 2. Standalone Python Toolkit
-
+### Standalone Python Toolkit
 ```bash
 git clone https://github.com/egecagintepe/celery-reliability-engineer.git
 cd celery-reliability-engineer
@@ -42,64 +57,50 @@ cd celery-reliability-engineer
 
 ---
 
-## CLI Usage (`celery_doctor.py`)
+## Before & After
 
-### 1. Lint Celery Configuration
-Audit any Celery settings file or Django settings module for 7 critical reliability rules:
-
-```bash
-python scripts/celery_doctor.py lint-config --config path/to/celery_conf.py
-```
-
-Sample output:
-```
-=== Celery Reliability Audit: celery_conf.py ===
-[CRITICAL] task_acks_late: Setting missing. Enables late acknowledgment.
-[HIGH] worker_prefetch_multiplier: Value is 4, expected 1. Prefetch=1 ensures workers only pull one task at a time.
-```
-
-### 2. Calculate Jittered Backoff Delay
-Generate realistic retry delays with full jitter:
-
-```bash
-python scripts/celery_doctor.py calc-backoff --attempt 3 --base-delay 2.0 --max-delay 120.0
-```
-
-### 3. Simulate Thundering Herd
-Demonstrate how fixed retries create massive request collisions compared to jittered backoff:
-
-```bash
-python scripts/celery_doctor.py simulate-herd --workers 50 --attempts 3
-```
+| Scenario | Naive Celery Setup | Celery Reliability Engineer |
+|---|---|---|
+| **Redis connection blips** | Silent memory fallback (separate workers double-process same job). | **Fail-Closed (`RedisDistributedLock`)**: Raises `RedisLockConnectionError`; never executes uncoordinated writes. |
+| **Worker dies during task execution (`SIGKILL`)** | Early ack: Task is marked done; work is lost forever. | **Late Ack (`acks_late=True`, `reject_on_worker_lost=True`)**: Unacknowledged message automatically requeued. |
+| **Downstream API returns HTTP 429** | Fixed 10s retry: All 50 workers strike API simultaneously (Thundering Herd). | **Full-Jitter Exponential Backoff**: Retries randomly decorrelated across time window. |
+| **Daily API Quota exhausted** | Worker retries every 10s all day (burns CPU and locks queue). | **Quota Reset Calculation**: Differentiates short rate-limits from daily quota resets; parks task until reset epoch. |
+| **Mixed fast & slow task queue** | Default prefetch=4: One worker pulls 8 long jobs; other workers sit idle. | **`prefetch_multiplier = 1`**: Ensures even task distribution across active worker pool. |
 
 ---
 
-## Python Helpers (`scripts/idempotency_helpers.py`)
+## Core Components
 
-### Distributed Task Lock (Context Manager)
+### 1. `RedisDistributedLock` (Fail-Closed Coordination)
+Zero-dependency, production-grade distributed lock with Lua atomic compare-and-delete:
+
 ```python
-from idempotency_helpers import IdempotentTaskLock, TaskLockAcquisitionError
+from idempotency_helpers import RedisDistributedLock, TaskLockAcquisitionError
 
 @app.task(bind=True, acks_late=True)
-def send_digest_email(self, user_id):
+def generate_monthly_invoice(self, customer_id):
     try:
-        with IdempotentTaskLock(key=f"digest_email_{user_id}", ttl_seconds=120):
-            # Safe from concurrent duplicate runs
-            deliver_email(user_id)
+        # Fails closed if Redis is down (never silently falls back to local memory)
+        with RedisDistributedLock(key=f"invoice_{customer_id}", ttl_seconds=120, redis_client=redis_conn):
+            # Safe execution boundary
+            process_invoice(customer_id)
     except TaskLockAcquisitionError:
-        logger.warning("Email task for user %s already running. Skipping.", user_id)
+        logger.warning("Invoice generation already in-flight by another worker.")
+        return {"status": "SKIPPED_CONCURRENT"}
 ```
 
-### Full-Jitter Backoff Calculator
+### 2. `JitteredBackoff` (Full-Jitter Exponential Retry)
+Eliminate thundering herds by decorrelating retry schedules:
+
 ```python
 from idempotency_helpers import JitteredBackoff
 
 backoff = JitteredBackoff(base_delay=2.0, max_delay=300.0)
 
 @app.task(bind=True, max_retries=5)
-def call_webhook(self, url, payload):
+def call_partner_webhook(self, url, payload):
     try:
-        post(url, json=payload)
+        send_webhook(url, payload)
     except TransientNetworkError as exc:
         delay = backoff.calculate_delay(self.request.retries + 1)
         raise self.retry(exc=exc, countdown=delay)
@@ -107,19 +108,85 @@ def call_webhook(self, url, payload):
 
 ---
 
-## Documentation
+## CLI Diagnostics (`celery_doctor.py`)
 
-- [Idempotency Patterns & Distributed Locks](references/idempotency_patterns.md)
-- [Worker Concurrency & Prefetch Tuning](references/concurrency_and_prefetch.md)
-- [Retry Storms & API Quota Handling](references/retry_storm_prevention.md)
-- [Broker Resilience & Connection Lifecycles](references/broker_resilience.md)
-- [Recommended Configuration Reference](examples/celery_conf_recommended.py)
+### 1. Audit Celery Configuration
+Audits any settings file or Django settings module using AST analysis, distinguishing static values from dynamic runtime variables:
+
+```bash
+# Heterogeneous mixed workload (default)
+python scripts/celery_doctor.py lint-config --config examples/celery_conf_recommended.py
+
+# Homogeneous uniform fast workload
+python scripts/celery_doctor.py lint-config --config examples/celery_conf_recommended.py --workload-profile homogeneous
+```
+
+Sample Output:
+```text
+=== Celery Reliability Audit: celery_conf.py (Profile: heterogeneous) ===
+
+[EXPLICITLY UNSAFE]:
+  ! worker_autoscale: Autoscale terminates busy workers mid-job during backlog recovery. Use fixed concurrency for non-trivial tasks.
+
+[DEFAULTS REQUIRING VERIFICATION]:
+  ? worker_prefetch_multiplier: Value is 4. On heterogeneous workloads, prefetch > 1 causes idle workers while one worker hoards long tasks.
+
+[VERIFIED SAFE (5 settings)]: task_acks_late, task_reject_on_worker_lost, worker_max_tasks_per_child, task_time_limit, broker_connection_retry_on_startup
+
+Final Audit Verdict: PASS
+```
+
+### 2. Calculate Jittered Backoff Schedules
+```bash
+python scripts/celery_doctor.py calc-backoff --attempt 3 --base-delay 2.0 --max-delay 120.0
+```
+
+### 3. Simulate Thundering Herd Collision Elimination
+```bash
+python scripts/celery_doctor.py simulate-herd --workers 50 --attempts 3
+```
+
+Output:
+```text
+Simulating 50 concurrent tasks over 3 retries:
+Fixed Interval Retry -> Peak Herd: 50 simultaneous requests at T=5s (THUNDERING HERD)
+Full Jitter Retry   -> Peak Herd: 3 simultaneous requests at T=4s (SMOOTH DISTRIBUTION)
+```
+
+---
+
+## Deep Documentation
+
+- [Idempotency Patterns & Distributed Locks](references/idempotency_patterns.md) — State machines vs locks
+- [Worker Concurrency & Prefetch Tuning](references/concurrency_and_prefetch.md) — Sizing worker pools safely
+- [Retry Storms & API Quota Handling](references/retry_storm_prevention.md) — Rate limits vs daily resets
+- [Broker Resilience & Connection Lifecycles](references/broker_resilience.md) — Visibility timeouts & keepalives
+- [Recommended Configuration Reference](examples/celery_conf_recommended.py) — Production baseline settings
+
+---
+
+## Verified Compatibility
+
+| Environment | Supported | Notes |
+|---|---|---|
+| **Python** | 3.8, 3.9, 3.10, 3.11, 3.12 | Standard library only; optional `redis-py` integration. |
+| **Celery** | 4.x, 5.x | Config-agnostic AST analysis. |
+| **Brokers** | Redis, RabbitMQ | Locking primitives specialized for Redis. |
+| **Agent Skills** | Specification v1.0 | Validated with official `skills-ref validate`. |
+| **AI Agents** | Claude Code, Cursor, Codex, Antigravity | Indexed via `SKILL.md`. |
+
+---
+
+## Safety Boundaries & Limitations
+
+- **Locks Do Not Equal Durable Idempotency**: A distributed lock provides *concurrency control*. Durable idempotency requires transactional database checkpoints (`UPDATE ... WHERE status = 'PENDING'`).
+- **Lock TTL Expiration**: If a task takes longer than its TTL, the lock will expire in Redis. For long-running batch jobs, pair with soft time limits or heartbeat renewal.
 
 ---
 
 ## Testing
 
-Run unit tests:
+Run the full automated test suite (19 tests):
 ```bash
 python -m unittest discover -s tests
 ```

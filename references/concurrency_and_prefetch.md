@@ -49,3 +49,4 @@ worker_max_tasks_per_child = 500
 worker_max_memory_per_child = 500000  # 500 MB (Celery 4.0+)
 ```
 Configuring `max_tasks_per_child` instructs Celery to gracefully retire and respawn child worker processes after processing N tasks, releasing leaked memory back to the operating system without dropping queued jobs.
+

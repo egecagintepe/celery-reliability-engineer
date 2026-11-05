@@ -52,3 +52,4 @@ Many modern APIs (e.g. LLM providers, Google, GitHub, Stripe) return HTTP 429 fo
    - Nature: Permanent until midnight PST/UTC.
    - Hazard: If classified as a transient 429, workers wake up every 10–30 seconds all day long, burning CPU, polluting logs, and blocking other tasks.
    - Action: **Classify definitively as DAILY_EXHAUSTED**. Park the task until the reset timestamp (e.g. `midnight + jitter_seconds`), or fail the batch explicitly and notify operators.
+

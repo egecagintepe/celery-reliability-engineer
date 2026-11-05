@@ -44,3 +44,4 @@ broker_pool_limit = 10
 ```
 
 For container health checks, avoid heavyweight `celery inspect ping` on busy workers (which can time out under high CPU load). Instead, inspect process existence and Redis responsiveness via `redis-cli ping`.
+

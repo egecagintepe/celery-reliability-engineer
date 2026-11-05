@@ -34,3 +34,4 @@ broker_transport_options = {
 # Task Result Expiration
 result_expires = 86400  # 24 hours
 task_ignore_result = False
+

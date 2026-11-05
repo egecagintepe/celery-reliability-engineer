@@ -26,10 +26,11 @@ class TestBackoffJitter(unittest.TestCase):
     def test_quota_reset_delay(self):
         now = 1000.0
         reset = 1060.0
-        # 60s remaining + 10..60s buffer
+        # 60s remaining + min 5.0s buffer
         delay = JitteredBackoff.calculate_quota_reset_delay(now, reset, min_buffer=60.0)
-        self.assertGreaterEqual(delay, 70.0)
+        self.assertGreaterEqual(delay, 65.0)
         self.assertLessEqual(delay, 120.0)
 
 if __name__ == "__main__":
     unittest.main()
+

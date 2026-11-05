@@ -1,88 +1,75 @@
 # Idempotency Patterns & Distributed Task Locks
 
-In distributed queue architectures like Celery, message brokers provide **at-least-once delivery guarantees**. Network partitions, worker timeouts, broker reconnects, and Celery visibility timeouts mean tasks **will** occasionally execute more than once.
+In distributed queue architectures like Celery, message brokers provide **at-least-once delivery guarantees**. Network blips, worker timeouts, broker reconnects, and Celery visibility timeouts guarantee that tasks **will** occasionally execute more than once.
 
-This guide provides proven design patterns to ensure state safety regardless of how many times a message is redelivered.
+This guide provides proven patterns to ensure state safety regardless of delivery duplicates.
 
 ---
 
-## 1. Natural Idempotency (State-Machine Transitions)
+## 1. Concurrency Control vs. Durable Idempotency
 
-The strongest idempotency pattern avoids blind `UPDATE` or `INSERT` operations and instead relies on strict state machine invariants.
+A common misconception is that a distributed lock (e.g. Redis SETNX) guarantees durable idempotency on its own. It does not:
+- **Distributed Locks** provide *concurrency control* (preventing two workers from processing the same entity simultaneously).
+- **Primary Database Constraints & State Machines** provide *durable idempotency* (preventing duplicate effects if a worker crashes after database commit but before message acknowledgment).
 
-### Anti-Pattern:
+A robust architecture combines both.
+
+---
+
+## 2. Distributed Lease Locks (`RedisDistributedLock`)
+
+When coordinating tasks across multiple containers or machines, use fail-closed distributed locks:
+
+### Key Requirements:
+1. **Fail Closed**: If the lock backend (Redis) is unreachable, the task must **not** execute uncoordinated writes. Never fall back to local in-memory locks in a distributed environment!
+2. **Unique Ownership Token**: Always generate a unique UUID per lock acquisition and release via an atomic Lua script:
+   ```lua
+   if redis.call("get", KEYS[1]) == ARGV[1] then
+       return redis.call("del", KEYS[1])
+   else
+       return 0
+   end
+   ```
+3. **Lock Expiry Limitation**: If a job runs longer than its `ttl_seconds`, the lock expires. Another worker can acquire it while the first is still working. To mitigate this:
+   - Size TTL comfortably above maximum task runtime.
+   - Use soft execution time limits (`task_soft_time_limit`).
+   - Guard database writes with optimistic locking / version checks (`UPDATE ... WHERE version = 1`).
+
+---
+
+## 3. Database State-Machine Transitions
+
+The primary defense against duplicate execution is atomic state transitions:
+
 ```python
-# Dangerous: Running twice charges user twice
-@app.task
-def process_order(order_id):
-    order = Order.objects.get(id=order_id)
-    payment_gateway.charge(order.user, order.total)
-    order.status = "PAID"
-    order.save()
-```
+from django.db import transaction
 
-### Resilient Pattern:
-```python
 @app.task(bind=True, acks_late=True)
 def process_order(self, order_id):
-    # Atomic state check and lock
+    # 1. Atomic state verification
     with transaction.atomic():
         order = Order.objects.select_for_update().get(id=order_id)
-        if order.status != OrderStatus.PENDING:
-            logger.info("Order %s already processed (status=%s). Skipping.", order_id, order.status)
+        if order.status == OrderStatus.COMPLETED:
+            logger.info("Order %s already completed. Acknowledging duplicate.", order_id)
             return
+        if order.status != OrderStatus.PENDING:
+            raise ValueError(f"Invalid state transition for order {order_id}: {order.status}")
 
         order.status = OrderStatus.PROCESSING
         order.save(update_fields=["status"])
 
-    # Idempotent gateway charge using order ID as idempotency key
-    charge_result = payment_gateway.charge(
-        user=order.user,
+    # 2. External gateway charge with idempotency key
+    charge = payment_gateway.charge(
         amount=order.total,
-        idempotency_key=f"order_{order.id}"
+        idempotency_key=f"order_charge_{order.id}"
     )
 
+    # 3. Commit completion
     with transaction.atomic():
         order.refresh_from_db()
-        order.status = OrderStatus.PAID
-        order.transaction_id = charge_result.id
-        order.save(update_fields=["status", "transaction_id"])
+        order.status = OrderStatus.COMPLETED
+        order.charge_id = charge.id
+        order.save(update_fields=["status", "charge_id"])
 ```
 
----
-
-## 2. Distributed Lease Locks (Redis Redlock Pattern)
-
-When database rows cannot easily represent intermediate states, guard the task entry point with a distributed lease lock.
-
-### Key Requirements:
-1. **Time-To-Live (TTL)**: Always attach a TTL so that if the worker process is killed by `SIGKILL` or hardware failure, the lock automatically expires.
-2. **Unique Token Release**: Workers must release the lock only if the token in Redis matches their own UUID. Otherwise, a slow worker could inadvertently release another worker's fresh lock.
-
-```python
-from idempotency_helpers import IdempotentTaskLock, TaskLockAcquisitionError
-
-@app.task(bind=True, acks_late=True)
-def synchronize_external_account(self, account_id):
-    try:
-        with IdempotentTaskLock(key=f"sync_account_{account_id}", ttl_seconds=120):
-            # Heavy sync logic here
-            do_external_sync(account_id)
-    except TaskLockAcquisitionError:
-        logger.warning("Synchronization for account %s already in flight.", account_id)
-        return
-```
-
----
-
-## 3. Database Checkpointing Before Enqueueing
-
-A common failure mode is enqueuing a task before the database transaction has committed:
-
-```
-Thread A: Start Tx -> Insert Record -> Enqueue Task -> Commit Tx
-Worker B:                         Pulls Task -> Read Record -> DOES NOT EXIST (404)!
-```
-
-### The Rule:
-Always enqueue tasks **after** database commit, e.g. using `transaction.on_commit(lambda: my_task.delay(id))` in Django, or persist an explicit `JobQueueRecord` in the DB first.
+If the worker crashes immediately after step 3, Celery will redeliver the message. Upon redelivery, step 1 detects `order.status == OrderStatus.COMPLETED` and safely exits without double-charging the customer.

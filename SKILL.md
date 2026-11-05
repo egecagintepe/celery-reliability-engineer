@@ -15,11 +15,13 @@ It addresses common distributed systems pitfalls: at-least-once message delivery
 
 1. **At-Least-Once Delivery Is Default**: Brokers guarantee delivery, not single execution. Every state-mutating task must either be naturally idempotent, protected by unique database constraints, or gated by a distributed lease lock.
 2. **Late Acknowledgments (`acks_late=True`)**: Celery tasks should acknowledge messages *after* completion. If a worker dies mid-task (`SIGKILL` or OOM), the unacknowledged message returns to the queue. Always pair this with `reject_on_worker_lost=True`.
-3. **Prefetch Multiplier = 1 for Variable Workloads**: For heterogeneous tasks (some running 100ms, others running 10 minutes), setting `worker_prefetch_multiplier = 1` ensures idle workers can pick up queued work rather than letting one busy worker hoard jobs.
+3. **Prefetch Multiplier Tuning**:
+   - For **heterogeneous workloads** (mixed fast sub-second tasks and slow multi-minute batch jobs), setting `worker_prefetch_multiplier = 1` ensures idle workers can pick up queued work rather than letting one busy worker hoard jobs.
+   - For **homogeneous ultra-fast workloads**, higher prefetch values (e.g. 4) allow broker batching efficiency.
 4. **Avoid Dangerous Autoscaling on Long Jobs**: Celery's built-in `autoscale` evaluates queue length, not job duration. Under heavy load, it can terminate workers holding long-running state. Prefer fixed concurrency (`worker_concurrency`) calibrated to host memory and CPU cores.
-5. **Durable State Checkpoints Before Enqueueing**: Persist job intent and initial state in the primary database *before* publishing to the broker. If the broker is unreachable, the system knows the job is pending and can retry safely.
+5. **Fail-Closed Distributed Locking**: Never fall back to in-memory locks when a distributed broker fails. Distributed locks provide concurrency control, not durable idempotency. Durable idempotency requires primary database transactional checkpoints.
 6. **Full-Jitter Exponential Backoff**: Never retry failed tasks on a fixed interval. Always inject randomized jitter to prevent the "thundering herd" effect where hundreds of failing tasks slam the database or an external API at the exact same millisecond.
-7. **Daily Quota vs Rate Limit Differentiation**: When third-party APIs return HTTP 429, differentiate between short-term rate limits (`Retry-After: 5s`) and daily quota exhaustion (`Quota Exceeded: 20/day`). Sleeping 10 seconds on a daily exhausted quota burns workers in useless loops; such tasks should be parked until the true daily reset epoch.
+7. **Daily Quota vs Rate Limit Differentiation**: When third-party APIs return HTTP 429, differentiate between short-term burst rate limits (`Retry-After: 5s`) and daily quota exhaustion (`Quota Exceeded: 20/day`). Sleeping 10 seconds on a daily exhausted quota burns workers in useless loops; such tasks should be parked until the true daily reset epoch.
 
 ---
 
@@ -63,7 +65,11 @@ It addresses common distributed systems pitfalls: at-least-once message delivery
 ### 1. Lint Celery Configuration
 Audit any Celery settings file or Django settings module for dangerous anti-patterns:
 ```bash
+# Heterogeneous workload profile (default)
 python scripts/celery_doctor.py lint-config --config path/to/celery_conf.py
+
+# Homogeneous workload profile
+python scripts/celery_doctor.py lint-config --config path/to/celery_conf.py --workload-profile homogeneous
 ```
 
 ### 2. Calculate Jittered Backoff
